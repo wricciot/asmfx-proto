@@ -153,11 +153,11 @@ let machine_step (m : ('t, 'r, 'rs, 'ms) machine) =
   let setregs regs = regs |> List.fold_left m.regstate.put m.regs in
   try
     match instr with
-    | Enter (a_cli, hs, statusregs, esaveregs) ->
+    | Enter (a_cli, hs, stateregs, esaveregs) ->
         let esave = getregs esaveregs in
-        let status = getregs statusregs in
+        let state = getregs stateregs in
         { m with regs = (pc, a_cli |> w_of_addr) |> setreg m;
-  		 ectx = HRcd ((hs, status), (apc', [], esave))::m.ectx; }
+  		 ectx = HRcd ((hs, state), (apc', [], esave))::m.ectx; }
     | Do (tag, csaveregs) -> 
         let dr, a_htag, (((_, state),_) as hrcd), c = m.ectx |> find_tag (`Tag tag) in
         let csave = getregs csaveregs in
@@ -166,6 +166,7 @@ let machine_step (m : ('t, 'r, 'rs, 'ms) machine) =
   		 ectx = KRcd ((apc', dr, csave), hrcd) :: c; }
     | Resume ohs ->
         let d, ar, dr, csave, ((hs, state), lrcd), c = m.ectx |> find_resume in
+        (* XXX: we may want to assert d = [] to ensure this is a tail-call, or just ignore improper use of Resume *)
         let stateregs = List.map fst state in
         (* obtain updated handler clauses/stateregs, or keep the old ones if ohs = None *)
         let hs',stateregs' = ohs |> unopt (hs,stateregs) in
@@ -202,7 +203,7 @@ let machine_step (m : ('t, 'r, 'rs, 'ms) machine) =
          * also preserved in the KRcd in case of further calls to the resumption *)
         { m with regs = (* (pc, ar |> w_of_addr) |> setreg m; *)
                         setregs ((pc, ar |> w_of_addr)::csave);
-          	 ectx = dr @ HRcd ((hs', state'), (apc', d @ [ KRcd ((ar, dr, csave), hrcd) ], hsave)) :: c; }
+          	 ectx = dr @ HRcd ((hs', state'), (apc', d @ [ KRcd ((ar, dr, csave), hrcd) ], hsave)) :: d @ c; }
     | FinalReenter (ohs, hsaveregs) ->
         let d, ar, dr, csave, ((hs, state), (al, dl, _esave as lrcd) as hrcd), c = m.ectx |> find_resume in
         let stateregs = List.map fst state in
@@ -214,10 +215,11 @@ let machine_step (m : ('t, 'r, 'rs, 'ms) machine) =
         let hsave = getregs hsaveregs in
         { m with regs = (* (pc, ar |> w_of_addr) |> setreg m; *)
                         setregs ((pc, ar |> w_of_addr)::csave);
-          	 ectx = dr @ HRcd ((hs', state'), (apc', d @ [ LRcd lrcd ], hsave)) :: c; }
+          	 ectx = dr @ HRcd ((hs', state'), (apc', d @ [ LRcd lrcd ], hsave)) :: d @ c; }
     | Primitive i ->
         let regs', mem' = i |> primop m'.pc m'.regstate m'.memstate m'.regs m'.mem in
         { m' with regs = regs'; mem = mem' }
+    | Nop -> { m with regs = (pc, apc' |> w_of_addr) |> setreg m }
     | Stop | DW _ -> raise MachineTrap
   with InadequateECtx _ -> raise MachineTrap
 ;;
@@ -316,6 +318,32 @@ let fibomem =
   (* 15 *)      ; Primitive (MovReg (Val 0, Arg 0))
   (* 16 *)      ; Exit]
 
+let ktestmem =
+  (* 'main *)
+  (* 0 *)	[ Enter (2 (*'cli1*), [(`RetTag, 9 (*'H1.ret*)); (`Tag `End, 10 (*'H1.end*))], [], [])
+  (* 1 *)	; Stop
+  (* 'cli1 *)
+  (* 2 *)	; Enter (4 (*'cli2*), [(`RetTag, 9 (*'H2.ret*)); (`Tag `Jump, 12 (*'H2.jump*))], [], [])
+  (* 3 *)	; Return
+  (* 'cli2 *)
+  (* 4 *)	; Do (`Jump, [])
+  (* 5 *)	; Do (`End, [])
+  (* 6 *)	; Return
+  (* 'cli3 *)	
+  (* 7 *)	; FinalReenter (None, [])
+  (* 8 *)	; Return
+  (* 'H1.ret 'H2.ret 'H3.ret *)
+  (* 9 *)	; Exit
+  (* 'H1.end *)
+  (* 10 *)	; Primitive (LoadImm (Val 0, 1))
+  (* 11 *)	; Break
+  (* 'H2.jump *)
+  (* 12 *)	; Enter (7 (*'cli3*), [(`RetTag, 9 (*'H3.ret*)); (`Tag `End, 14 (*'H3.end*))], [], [])
+  (* 13 *)	; Break
+  (* 'H3.end *)
+  (* 14 *)	; Primitive (LoadImm (Val 0, 2))
+  (* 15 *)	; Break ]
+  
 let registers = []
 
 (* the register file is an associative list pairing reg names with words; Zero is always 0 and never
@@ -378,7 +406,20 @@ let ex_fibo = {
         decode = decode;
 }
 
-let pp_tag = function `Charge -> "charge" | `TagA -> "tagA" | `TagB -> "tagB"
+
+(* a test showing handler shadowing when entering a new handler while handling a certain operation *)
+let ex_ktest = {
+        pc = PC;
+        regs = registers;
+        mem = ktestmem;
+        regstate = regstate;
+        memstate = memstate;
+        ectx = [];
+        decode = decode;
+}
+
+
+let pp_tag = function `Charge -> "charge" | `TagA -> "tagA" | `TagB -> "tagB" | `End -> "end" | `Jump -> "jump"
 
 let pp_htag = function `RetTag -> "return" | `Tag t -> pp_tag t
 
@@ -412,6 +453,7 @@ let pp_instruction = function
 | Reenter (Some (hs,stateregs),hsaveregs) -> Printf.sprintf "reenter %s,%s,%s" (pp_handler hs) (pp_reglist stateregs) (pp_reglist hsaveregs)
 | FinalReenter (None,hsaveregs) -> Printf.sprintf "finalreenter %s" (pp_reglist hsaveregs)
 | FinalReenter (Some (hs,stateregs),hsaveregs) -> Printf.sprintf "finalreenter %s,%s,%s" (pp_handler hs) (pp_reglist stateregs) (pp_reglist hsaveregs)
+| Nop -> "nop"
 | Stop -> "stop"
 | DW w -> Printf.sprintf "DW %d" w
 
@@ -436,4 +478,4 @@ let rec run_test n m =
   if n <= 0 then ()
   else try run_test (n-1) (machine_step m) with MachineTrap -> ()
 
-let _ = run_test 1000 ex_fibo
+let _ = run_test 1000 ex_ktest

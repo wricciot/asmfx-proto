@@ -23,3 +23,4 @@ and ('a, 't, 'r, 'w) instr =
 | Primitive	of ('a, 'r, 'w) primitive
 | Stop
 | DW            of 'w
+| Nop
